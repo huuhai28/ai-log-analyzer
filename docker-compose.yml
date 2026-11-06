@@ -1,0 +1,191 @@
+# =============================================================================
+# AI Log Analyzer — bộ giám sát + phân tích log bằng AI cho app chạy bằng Docker
+#
+#   cp .env.example .env      # điền OPENAI_API_KEY (và Telegram nếu muốn)
+#   docker compose up -d
+#
+# Luồng:
+#   App (container) ──stdout──► Filebeat ─► Logstash ─► Elasticsearch ─► Kibana
+#   App /metrics ─────────────► Prometheus ─► Alertmanager ─┐
+#                                    │                       ▼
+#                                 Grafana            n8n workflow ──► OpenAI (phân tích)
+#                                                      ▲    │
+#                                       quét 30 phút ──┘    └─► lưu Elasticsearch (ai-analysis) + Telegram
+#
+# Mặc định giám sát project web-platform (github.com/huuhai28/web-platform) chạy cùng máy:
+#   - Log: container thuộc compose project khớp regex WATCH_PROJECTS
+#   - Metrics: backend publish cổng 8000 ra máy host → Prometheus scrape host.docker.internal:8000
+#
+# Cần ~2,5 GB RAM cho Docker. Mọi giao diện chỉ mở trên 127.0.0.1:
+#   Kibana http://localhost:5601   Grafana http://localhost:3001   Prometheus http://localhost:9090
+#   Alertmanager http://localhost:9093   n8n http://localhost:5678
+# =============================================================================
+name: ai-log-analyzer
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }
+
+services:
+  # ---------------------------------------------------------------------------
+  # Log: Filebeat → Logstash → Elasticsearch → Kibana
+  # ---------------------------------------------------------------------------
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.17.4
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false" # lab: chỉ mở trong mạng Docker + 127.0.0.1
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+      cluster.routing.allocation.disk.threshold_enabled: "false"
+    volumes: [es_data:/usr/share/elasticsearch/data]
+    ports: ["127.0.0.1:9200:9200"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s' >/dev/null"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+    deploy: { resources: { limits: { memory: 1200M } } }
+    restart: unless-stopped
+    logging: *logging
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.17.4
+    environment:
+      LS_JAVA_OPTS: -Xms256m -Xmx256m
+      XPACK_MONITORING_ENABLED: "false"
+      PIPELINE_WORKERS: "1"
+    volumes: [./elk/logstash/pipeline:/usr/share/logstash/pipeline:ro]
+    depends_on:
+      elasticsearch: { condition: service_healthy }
+    deploy: { resources: { limits: { memory: 768M } } }
+    restart: unless-stopped
+    logging: *logging
+
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.17.4
+    user: root # cần quyền đọc log của Docker
+    command: ["filebeat", "-e", "--strict.perms=false"]
+    environment:
+      # Regex tên compose project cần thu log (mặc định: bản dev + prod của web-platform)
+      WATCH_PROJECTS: ${WATCH_PROJECTS:-^(personal-web-platform|personal-web-prod)$}
+    volumes:
+      - ./elk/filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - filebeat_data:/usr/share/filebeat/data
+    depends_on: [logstash]
+    deploy: { resources: { limits: { memory: 128M } } }
+    restart: unless-stopped
+    logging: *logging
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.17.4
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      NODE_OPTIONS: --max-old-space-size=512
+      TELEMETRY_OPTIN: "false"
+    ports: ["127.0.0.1:5601:5601"]
+    depends_on:
+      elasticsearch: { condition: service_healthy }
+    deploy: { resources: { limits: { memory: 1024M } } }
+    restart: unless-stopped
+    logging: *logging
+
+  kibana-setup: # tạo index template + data view một lần
+    image: curlimages/curl:8.12.1
+    entrypoint: ["/bin/sh", "/setup.sh"]
+    volumes: [./elk/kibana/setup.sh:/setup.sh:ro]
+    depends_on: [kibana]
+    restart: on-failure
+    logging: *logging
+
+  # ---------------------------------------------------------------------------
+  # Metrics + cảnh báo: Prometheus → Alertmanager → n8n ; Grafana dashboard
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+      - prometheus_data:/prometheus
+    extra_hosts: ["host.docker.internal:host-gateway"] # cho Linux; Docker Desktop đã có sẵn
+    ports: ["127.0.0.1:9090:9090"]
+    deploy: { resources: { limits: { memory: 384M } } }
+    restart: unless-stopped
+    logging: *logging
+
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    volumes: [./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro]
+    ports: ["127.0.0.1:9093:9093"]
+    deploy: { resources: { limits: { memory: 64M } } }
+    restart: unless-stopped
+    logging: *logging
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin_dev_password}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/app-overview.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports: ["127.0.0.1:3001:3000"]
+    depends_on: [prometheus, elasticsearch]
+    deploy: { resources: { limits: { memory: 256M } } }
+    restart: unless-stopped
+    logging: *logging
+
+  # ---------------------------------------------------------------------------
+  # n8n: tự động hóa — cảnh báo / quét định kỳ → lấy log lỗi → AI phân tích → lưu + Telegram
+  # ---------------------------------------------------------------------------
+  n8n:
+    image: n8nio/n8n:1.88.0
+    # Nạp workflow từ Git (cập nhật nếu đã có), bật nó, rồi khởi động n8n
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        n8n import:workflow --input=/workflows/ai-log-analyzer.json &&
+        n8n update:workflow --id=aiLogAnalyzer001 --active=true &&
+        exec n8n start
+    environment:
+      GENERIC_TIMEZONE: Asia/Ho_Chi_Minh
+      TZ: Asia/Ho_Chi_Minh
+      N8N_HOST: localhost
+      WEBHOOK_URL: http://localhost:5678/
+      N8N_SECURE_COOKIE: "false" # chạy http trên localhost
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_PERSONALIZATION_ENABLED: "false"
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:-change-me-local-n8n-encryption-key}
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false" # workflow đọc cấu hình bên dưới qua $env
+      ES_URL: http://elasticsearch:9200
+      LOG_WINDOW_MINUTES: ${LOG_WINDOW_MINUTES:-15}
+      SYSTEM_DESCRIPTION: ${SYSTEM_DESCRIPTION:-website portfolio gồm nginx, FastAPI, Celery worker, PostgreSQL, Redis, Keycloak chạy bằng Docker Compose}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    volumes:
+      - ./n8n/workflows:/workflows:ro
+      - n8n_data:/home/node/.n8n
+    ports: ["127.0.0.1:5678:5678"]
+    depends_on:
+      elasticsearch: { condition: service_healthy }
+    deploy: { resources: { limits: { memory: 512M } } }
+    restart: unless-stopped
+    logging: *logging
+
+volumes:
+  es_data:
+  filebeat_data:
+  prometheus_data:
+  grafana_data:
+  n8n_data:

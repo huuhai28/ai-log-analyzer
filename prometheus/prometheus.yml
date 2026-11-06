@@ -1,0 +1,19 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files: [/etc/prometheus/alerts.yml]
+
+alerting:
+  alertmanagers:
+    - static_configs: [{ targets: ["alertmanager:9093"] }]
+
+scrape_configs:
+  # App cần giám sát: endpoint /metrics (prometheus-client). Mặc định là backend FastAPI của
+  # web-platform, publish cổng 8000 ra máy host. Đổi target để giám sát app khác.
+  - job_name: app
+    static_configs:
+      - targets: ["host.docker.internal:8000"]
+        labels: { app: personal-web-platform }
+  - job_name: prometheus
+    static_configs: [{ targets: ["localhost:9090"] }]

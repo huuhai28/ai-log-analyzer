@@ -1,0 +1,258 @@
+{
+  "id": "aiLogAnalyzer001",
+  "name": "AI log analyzer",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "alertmanager",
+        "options": {}
+      },
+      "id": "42957e07-c0fc-4bbb-8699-7802b4c96f46",
+      "name": "Alertmanager webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "ce583ff1-3d85-49b4-8658-64799240d4e0"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 30
+            }
+          ]
+        }
+      },
+      "id": "6f754e76-730a-4bb7-8dbe-6a228160e7f1",
+      "name": "Every 30 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Xác định nguồn kích hoạt và dựng truy vấn Elasticsearch lấy log lỗi/cảnh báo gần đây\nconst item = $input.first().json;\nconst alerts = item.body?.alerts ?? [];\nconst minutes = Number($env.LOG_WINDOW_MINUTES || 15);\nconst esQuery = {\n  size: 60,\n  sort: [{ \"@timestamp\": \"desc\" }],\n  query: {\n    bool: {\n      filter: [{ range: { \"@timestamp\": { gte: \"now-\" + minutes + \"m\" } } }],\n      should: [\n        { terms: { level: [\"ERROR\", \"CRITICAL\", \"WARNING\"] } },\n        { range: { \"http.status_code\": { gte: 500 } } },\n      ],\n      minimum_should_match: 1,\n    },\n  },\n};\nreturn [{\n  json: {\n    source: alerts.length ? \"alertmanager\" : \"schedule\",\n    alerts: alerts.map((a) => ({\n      name: a.labels?.alertname, severity: a.labels?.severity,\n      summary: a.annotations?.summary, description: a.annotations?.description, startsAt: a.startsAt,\n    })),\n    minutes,\n    esQuery,\n  },\n}];"
+      },
+      "id": "8305f7fd-5dca-4add-81b3-093ccb3296ac",
+      "name": "Build context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "options": {},
+        "method": "POST",
+        "url": "={{ $env.ES_URL }}/portfolio-logs-*/_search?ignore_unavailable=true&allow_no_indices=true",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.esQuery) }}"
+      },
+      "id": "78a5d931-3301-43ef-8019-8905ddaf98c2",
+      "name": "Search error logs",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Gom log thành đoạn văn ngắn, che bí mật, dựng prompt cho AI.\n// Quét định kỳ mà không có lỗi thật → dừng luôn (không tốn tiền gọi AI).\nconst ctx = $('Build context').first().json;\nconst hits = $input.first().json.hits?.hits ?? [];\nconst status = (s) => s['http.status_code'] ?? s.http?.status_code;\nconst errors = hits.filter((h) => h._source.level === 'ERROR' || h._source.level === 'CRITICAL' || status(h._source) >= 500);\nif (ctx.source === 'schedule' && errors.length === 0) return [];\n\nconst redact = (t) => String(t ?? '')\n  .replace(/(bearer\\s+)[\\w.~+/=-]+/gi, '$1[REDACTED]')\n  .replace(/((?:password|passwd|secret|token|api[_-]?key)[\"'\\s:=]+)[^\\s\"',}]+/gi, '$1[REDACTED]')\n  .replace(/\\b(re|sk|ghp|glpat)[-_][A-Za-z0-9_-]{8,}/g, '[REDACTED_KEY]');\n\nconst lines = hits.slice(0, 60).map(({ _source: s }) => {\n  const route = s['http.route'] ?? s['url.path'] ?? '';\n  const stack = s['error.stack'] ? '\\n    ' + redact(s['error.stack']).slice(0, 600).replace(/\\n/g, '\\n    ') : '';\n  return [s['@timestamp'], '[' + s.level + ']', s.service ?? s.compose_service ?? '?', status(s) ?? '', route,\n    'rid=' + (s.request_id ?? '-'), redact(s.message).slice(0, 300)].join(' ') + stack;\n});\n\nconst alertText = ctx.alerts.length\n  ? ctx.alerts.map((a) => '- ' + a.name + ' [' + a.severity + ']: ' + (a.summary ?? '') + ' ' + (a.description ?? '')).join('\\n')\n  : '(không có — đây là lần quét định kỳ)';\n\nconst prompt = [\n  'Bạn là kỹ sư SRE. Hệ thống đang giám sát: ' + ($env.SYSTEM_DESCRIPTION || 'ứng dụng web chạy bằng Docker') + '.',\n  '',\n  'CẢNH BÁO:',\n  alertText,\n  '',\n  'LOG ' + ctx.minutes + ' PHÚT GẦN NHẤT (' + hits.length + ' dòng, mới nhất trước):',\n  lines.join('\\n') || '(không có log lỗi nào trong khoảng thời gian này)',\n  '',\n  'Hãy trả lời bằng tiếng Việt, tối đa 200 từ, theo đúng 4 mục:',\n  '1. Chuyện gì đang xảy ra (1–2 câu)',\n  '2. Nguyên nhân khả dĩ nhất, dựa trên bằng chứng trong log (trích request_id nếu có)',\n  '3. Mức độ: thấp / trung bình / cao',\n  '4. 2–3 bước kiểm tra hoặc khắc phục cụ thể (ví dụ lệnh docker compose cần chạy)',\n  'Nếu log không đủ để kết luận, nói rõ là không đủ dữ liệu, đừng đoán.',\n].join('\\n');\n\nreturn [{\n  json: {\n    ...ctx,\n    logCount: hits.length,\n    errorCount: errors.length,\n    logExcerpt: lines.slice(0, 15).join('\\n'),\n    requestBody: { model: $env.OPENAI_MODEL || 'gpt-4.1-mini', input: prompt, max_output_tokens: 700 },\n  },\n}];"
+      },
+      "id": "5129aad4-95a0-4bf1-8f86-0cde0becadf2",
+      "name": "Prepare prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "options": {
+          "timeout": 60000
+        },
+        "method": "POST",
+        "url": "={{ ($env.OPENAI_BASE_URL || 'https://api.openai.com/v1') + '/responses' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.OPENAI_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.requestBody) }}"
+      },
+      "id": "8dbaeb8e-db74-4292-8889-062eac8ffeac",
+      "name": "Ask AI",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        960,
+        100
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Lấy câu trả lời của AI (OpenAI Responses API). AI lỗi → vẫn tạo báo cáo kèm log gốc để không mất cảnh báo.\nconst ctx = $('Prepare prompt').first().json;\nconst r = $input.first().json;\nlet analysis = r.output_text;\nif (!analysis && Array.isArray(r.output)) {\n  analysis = r.output.flatMap((o) => o.content ?? []).filter((c) => c.type === 'output_text').map((c) => c.text).join('\\n');\n}\nconst aiOk = Boolean(analysis);\nif (!aiOk) {\n  const reason = r.error?.message ?? (typeof r.error === 'string' ? r.error : 'không có phản hồi');\n  analysis = '⚠️ Không gọi được AI (' + reason + '). Log gốc:\\n' + ctx.logExcerpt;\n}\nconst title = ctx.alerts.length\n  ? ctx.alerts.map((a) => a.name + ' (' + a.severity + ')').join(', ')\n  : 'Quét định kỳ: ' + ctx.errorCount + ' lỗi trong ' + ctx.minutes + ' phút';\nreturn [{\n  json: {\n    doc: {\n      '@timestamp': new Date().toISOString(),\n      source: ctx.source,\n      title,\n      alerts: ctx.alerts,\n      log_count: ctx.logCount,\n      error_count: ctx.errorCount,\n      window_minutes: ctx.minutes,\n      model: ctx.requestBody.model,\n      ai_ok: aiOk,\n      analysis,\n    },\n    telegramText: ('🔎 ' + title + '\\n\\n' + analysis).slice(0, 3900),\n  },\n}];"
+      },
+      "id": "70fb992c-20ba-4d68-8e1b-6a10d7c015c1",
+      "name": "Build report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "options": {},
+        "method": "POST",
+        "url": "={{ $env.ES_URL }}/ai-analysis/_doc?refresh=true",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.doc) }}"
+      },
+      "id": "3c79cab7-06af-4d4a-89dc-c33e170c14d0",
+      "name": "Save to Elasticsearch",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1440,
+        100
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Gửi Telegram nếu đã cấu hình TELEGRAM_BOT_TOKEN và TELEGRAM_CHAT_ID; không thì bỏ qua\nconst token = $env.TELEGRAM_BOT_TOKEN;\nconst chatId = $env.TELEGRAM_CHAT_ID;\nif (!token || !chatId) return [{ json: { telegram: 'skipped — chưa cấu hình' } }];\nconst text = $('Build report').first().json.telegramText;\nconst res = await this.helpers.httpRequest({\n  method: 'POST',\n  url: 'https://api.telegram.org/bot' + token + '/sendMessage',\n  body: { chat_id: chatId, text, disable_web_page_preview: true },\n  json: true,\n});\nreturn [{ json: { telegram: res.ok ? 'sent' : 'failed' } }];"
+      },
+      "id": "467e37b3-13d2-4c39-8594-f8a158440d65",
+      "name": "Notify Telegram",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        100
+      ]
+    }
+  ],
+  "connections": {
+    "Alertmanager webhook": {
+      "main": [
+        [
+          {
+            "node": "Build context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every 30 minutes": {
+      "main": [
+        [
+          {
+            "node": "Build context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build context": {
+      "main": [
+        [
+          {
+            "node": "Search error logs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search error logs": {
+      "main": [
+        [
+          {
+            "node": "Prepare prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare prompt": {
+      "main": [
+        [
+          {
+            "node": "Ask AI",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ask AI": {
+      "main": [
+        [
+          {
+            "node": "Build report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build report": {
+      "main": [
+        [
+          {
+            "node": "Save to Elasticsearch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save to Elasticsearch": {
+      "main": [
+        [
+          {
+            "node": "Notify Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all"
+  },
+  "pinData": {}
+}

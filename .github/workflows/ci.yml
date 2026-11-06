@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate configs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Docker Compose
+        run: docker compose config --quiet
+
+      - name: Prometheus config + alert rules (promtool)
+        run: docker run --rm -v "$PWD/prometheus:/etc/prometheus:ro" --entrypoint promtool prom/prometheus:v3.2.1 check config /etc/prometheus/prometheus.yml
+
+      - name: Alertmanager config (amtool)
+        run: docker run --rm -v "$PWD/alertmanager:/etc/alertmanager:ro" --entrypoint amtool prom/alertmanager:v0.28.1 check-config /etc/alertmanager/alertmanager.yml
+
+      - name: Logstash pipeline syntax
+        run: |
+          docker run --rm -v "$PWD/elk/logstash/pipeline:/usr/share/logstash/pipeline:ro" \
+            -e XPACK_MONITORING_ENABLED=false docker.elastic.co/logstash/logstash:8.17.4 \
+            logstash --config.test_and_exit -f /usr/share/logstash/pipeline/logstash.conf
+
+      - name: Filebeat config
+        run: |
+          docker run --rm -e WATCH_PROJECTS='^demo$' -v "$PWD/elk/filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro" \
+            docker.elastic.co/beats/filebeat:8.17.4 test config --strict.perms=false
+
+  test:
+    name: Test n8n workflow logic
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Workflow JSON khớp với mã nguồn n8n/build-workflow.js
+        run: |
+          node n8n/build-workflow.js
+          git diff --exit-code -- n8n/workflows || { echo "Hãy chạy: node n8n/build-workflow.js và commit file JSON"; exit 1; }
+      - name: Dashboard JSON hợp lệ
+        run: for f in grafana/dashboards/*.json; do node -e "JSON.parse(require('fs').readFileSync('$f','utf8'))" && echo "OK $f"; done
+      - run: node --test "tests/**/*.test.mjs"

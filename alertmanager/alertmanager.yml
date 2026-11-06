@@ -1,0 +1,13 @@
+# Mọi cảnh báo gửi sang n8n → n8n lấy log liên quan từ Elasticsearch → hỏi AI → lưu/ gửi Telegram
+route:
+  receiver: n8n-ai-analyzer
+  group_by: [alertname]
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 4h
+
+receivers:
+  - name: n8n-ai-analyzer
+    webhook_configs:
+      - url: http://n8n:5678/webhook/alertmanager
+        send_resolved: false

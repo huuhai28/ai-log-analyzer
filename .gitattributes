@@ -1,0 +1,2 @@
+# Mọi file văn bản dùng LF (chạy trong container Linux)
+* text=auto eol=lf

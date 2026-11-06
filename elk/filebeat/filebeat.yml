@@ -1,0 +1,24 @@
+# Filebeat đọc log stdout/stderr của các container (file JSON của Docker) và gửi sang Logstash.
+filebeat.inputs:
+  - type: filestream
+    id: docker-containers
+    paths: ["/var/lib/docker/containers/*/*.log"]
+    parsers:
+      - container: { stream: all, format: docker }
+    prospector.scanner.symlinks: true
+
+processors:
+  - add_docker_metadata:
+      host: "unix:///var/run/docker.sock"
+  # Chỉ giữ log của các compose project cần giám sát (regex trong biến WATCH_PROJECTS).
+  # Log của chính ai-log-analyzer không khớp nên tự bị bỏ, tránh vòng lặp.
+  - drop_event:
+      when:
+        not:
+          regexp:
+            container.labels.com_docker_compose_project: "${WATCH_PROJECTS}"
+
+output.logstash:
+  hosts: ["logstash:5044"]
+
+logging.level: warning

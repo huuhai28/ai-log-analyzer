@@ -1,0 +1,28 @@
+groups:
+  - name: app
+    rules:
+      - alert: AppDown
+        expr: up{job="app"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "App không phản hồi"
+          description: "Prometheus không scrape được /metrics của app trong hơn 1 phút."
+
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m]))
+            / clamp_min(sum(rate(http_requests_total[5m])), 1e-9) > 0.05
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "Tỉ lệ lỗi 5xx của API > 5%"
+          description: "{{ $value | humanizePercentage }} request trả về 5xx trong 5 phút qua."
+
+      - alert: HighLatencyP95
+        expr: histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[5m]))) > 1
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "API chậm: p95 > 1 giây"
+          description: "p95 hiện tại {{ $value | humanizeDuration }}."
