@@ -1,5 +1,7 @@
 # AI Log Analyzer
 
+[![CI](https://github.com/huuhai28/ai-log-analyzer/actions/workflows/ci.yml/badge.svg)](https://github.com/huuhai28/ai-log-analyzer/actions/workflows/ci.yml)
+
 Bộ **observability + phân tích log bằng AI** chạy bằng một lệnh `docker compose up`: thu log và metrics
 của ứng dụng Docker, cảnh báo khi có sự cố, rồi để **n8n tự động gọi AI đọc log và đề xuất cách xử lý**.
 
